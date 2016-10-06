@@ -53,6 +53,14 @@ impl<'a, W: Send + Terminal> BufferSearcher<'a, W> {
         self
     }
 
+    /// If enabled, searching will print the path instead of each match.
+    ///
+    /// Disabled by default.
+    pub fn files_with_matches(mut self, yes: bool) -> Self {
+        self.opts.files_with_matches = yes;
+        self
+    }
+
     /// Set the end-of-line byte used by this searcher.
     pub fn eol(mut self, eol: u8) -> Self {
         self.opts.eol = eol;
@@ -70,6 +78,13 @@ impl<'a, W: Send + Terminal> BufferSearcher<'a, W> {
     /// them.
     pub fn line_number(mut self, yes: bool) -> Self {
         self.opts.line_number = yes;
+        self
+    }
+
+    /// If enabled, don't show any output and quit searching after the first
+    /// match is found.
+    pub fn quiet(mut self, yes: bool) -> Self {
+        self.opts.quiet = yes;
         self
     }
 
@@ -96,6 +111,9 @@ impl<'a, W: Send + Terminal> BufferSearcher<'a, W> {
                 self.print_match(m.start(), m.end());
             }
             last_end = m.end();
+            if self.opts.stop_after_first_match() {
+                break;
+            }
         }
         if self.opts.invert_match {
             let upto = self.buf.len();
@@ -104,13 +122,16 @@ impl<'a, W: Send + Terminal> BufferSearcher<'a, W> {
         if self.opts.count && self.match_count > 0 {
             self.printer.path_count(self.path, self.match_count);
         }
+        if self.opts.files_with_matches && self.match_count > 0 {
+            self.printer.path(self.path);
+        }
         self.match_count
     }
 
     #[inline(always)]
     pub fn print_match(&mut self, start: usize, end: usize) {
         self.match_count += 1;
-        if self.opts.count {
+        if self.opts.skip_matches() {
             return;
         }
         self.count_lines(start);
@@ -235,6 +256,14 @@ and exhibited clearly, with a label attached.\
             "Sherlock", SHERLOCK, |s| s.count(true));
         assert_eq!(2, count);
         assert_eq!(out, "/baz.rs:2\n");
+    }
+
+    #[test]
+    fn files_with_matches() {
+        let (count, out) = search(
+            "Sherlock", SHERLOCK, |s| s.files_with_matches(true));
+        assert_eq!(1, count);
+        assert_eq!(out, "/baz.rs\n");
     }
 
     #[test]

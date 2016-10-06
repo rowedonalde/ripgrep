@@ -30,7 +30,7 @@ for a very detailed comparison with more benchmarks and analysis.
 | ripgrep | `rg -n -w '[A-Z]+_SUSPEND'` | 450 | **0.245s** |
 | [The Silver Searcher](https://github.com/ggreer/the_silver_searcher) | `ag -w '[A-Z]+_SUSPEND'` | 450 | 0.753s |
 | [git grep](https://www.kernel.org/pub/software/scm/git/docs/git-grep.html) | `LC_ALL=C git grep -E -n -w '[A-Z]+_SUSPEND'` | 450 | 0.823s |
-| [git grep](https://www.kernel.org/pub/software/scm/git/docs/git-grep.html) | `LC_ALL=en_US.UTF-8 git grep -E -n -w '[A-Z]+_SUSPEND'` | 450 | 2.880s |
+| [git grep (Unicode)](https://www.kernel.org/pub/software/scm/git/docs/git-grep.html) | `LC_ALL=en_US.UTF-8 git grep -E -n -w '[A-Z]+_SUSPEND'` | 450 | 2.880s |
 | [sift](https://github.com/svent/sift) | `sift --git -n -w '[A-Z]+_SUSPEND'` | 450 | 3.656s |
 | [The Platinum Searcher](https://github.com/monochromegane/the_platinum_searcher) | `pt -w -e '[A-Z]+_SUSPEND'` | 450 | 12.369s |
 | [ack](http://beyondgrep.com/) | `ack -w '[A-Z]+_SUSPEND'` | 1878 | 16.952s |
@@ -97,19 +97,17 @@ but you'll need to have the
 [Microsoft VC++ 2015 redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=48145)
 installed.
 
-If you're a **Homebrew** user, then you can install it with a custom formula
-(N.B. `ripgrep` isn't actually in Homebrew yet. This just installs the binary
-directly):
+If you're a **Homebrew** user, then you can install it with a custom tap:
 
 ```
-$ brew install https://raw.githubusercontent.com/BurntSushi/ripgrep/master/pkg/brew/ripgrep.rb
+$ brew tap burntsushi/ripgrep https://github.com/BurntSushi/ripgrep.git
+$ brew install burntsushi/ripgrep/ripgrep-bin
 ```
 
-If you're an **Archlinux** user, then you can install `ripgrep` from the
-[`ripgrep` AUR package](https://aur.archlinux.org/packages/ripgrep/), e.g.,
+If you're an **Arch Linux** user, then you can install `ripgrep` from the official repos:
 
 ```
-$ yaourt -S ripgrep
+$ pacman -S ripgrep
 ```
 
 If you're a **Rust programmer**, `ripgrep` can be installed with `cargo`:
@@ -215,10 +213,11 @@ $ rg -Tjs foobar
 ```
 
 To see a list of types supported, run `rg --type-list`. To add a new type, use
-`--type-add`:
+`--type-add`, which must be accompanied by a pattern for searching (`rg` won't
+persist your type settings):
 
 ```
-$ rg --type-add 'foo:*.foo,*.foobar'
+$ rg --type-add 'foo:*.{foo,foobar}' -tfoo bar
 ```
 
 The type `foo` will now match any file ending with the `.foo` or `.foobar`

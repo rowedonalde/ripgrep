@@ -39,10 +39,10 @@ Usage: rg [options] -e PATTERN ... [<path> ...]
        rg [options] <pattern> [<path> ...]
        rg [options] --files [<path> ...]
        rg [options] --type-list
-       rg --help
-       rg --version
+       rg [options] --help
+       rg [options] --version
 
-rg combines the usability of The Silver Searcher with the raw speed of grep.
+rg recursively searches your current directory for a regex pattern.
 
 Common options:
     -a, --text                 Search binary files as if they were text.
@@ -62,10 +62,12 @@ Common options:
                                Precede a glob with a '!' to exclude it.
     -h, --help                 Show this usage message.
     -i, --ignore-case          Case insensitive search.
+                               Overridden by --case-sensitive.
     -n, --line-number          Show line numbers (1-based). This is enabled
                                by default at a tty.
     -N, --no-line-number       Suppress line numbers.
-    -q, --quiet                Do not print anything to stdout.
+    -q, --quiet                Do not print anything to stdout. If a match is
+                               found in a file, stop searching that file.
     -r, --replace ARG          Replace every match with the string given.
                                Capture group indices (e.g., $5) and names
                                (e.g., $foo) are supported.
@@ -110,9 +112,16 @@ Less common options:
     --files
         Print each file that would be searched (but don't search).
 
+    -l, --files-with-matches
+        Only show path of each file with matches.
+
     -H, --with-filename
         Prefix each match with the file name that contains it. This is the
         default when more than one file is searched.
+
+    --no-filename
+        Never show the filename for a match. This is the default when
+        one file is searched.
 
     --heading
         Show the file name above clusters of matches from each file.
@@ -127,6 +136,10 @@ Less common options:
 
     -L, --follow
         Follow symlinks.
+
+    --maxdepth NUM
+        Descend at most NUM directories below the command line arguments.
+        A value of zero only searches the starting-points themselves.
 
     --mmap
         Search using memory maps when possible. This is enabled by default
@@ -143,8 +156,26 @@ Less common options:
     --no-ignore-parent
         Don't respect ignore files in parent directories.
 
+    --no-ignore-vcs
+        Don't respect version control ignore files (e.g., .gitignore).
+        Note that .ignore files will continue to be respected.
+
+    --null
+        Whenever a file name is printed, follow it with a NUL byte.
+        This includes printing filenames before matches, and when printing
+        a list of matching files such as with --count, --files-with-matches
+        and --files.
+
     -p, --pretty
         Alias for --color=always --heading -n.
+
+    -s, --case-sensitive
+        Search case sensitively. This overrides --ignore-case and --smart-case.
+
+    -S, --smart-case
+        Search case insensitively if the pattern is all lowercase.
+        Search case sensitively otherwise. This is overridden by
+        either --case-sensitive or --ignore-case.
 
     -j, --threads ARG
         The number of threads to use. Defaults to the number of logical CPUs
@@ -163,11 +194,17 @@ File type management options:
         Show all supported file types and their associated globs.
 
     --type-add ARG ...
-        Add a new glob for a particular file type.
-        Example: --type-add html:*.html,*.htm
+        Add a new glob for a particular file type. Only one glob can be added
+        at a time. Multiple type-add flags can be provided. Unless type-clear
+        is used, globs are added to any existing globs inside of ripgrep. Note
+        that this must be passed to every invocation of rg.
+
+        Example: `--type-add html:*.html`
 
     --type-clear TYPE ...
-        Clear the file type globs for TYPE.
+        Clear the file type globs previously defined for TYPE. This only clears
+        the default type definitions that are found inside of ripgrep. Note
+        that this must be passed to every invocation of rg.
 ";
 
 /// RawArgs are the args as they are parsed from Docopt. They aren't used
@@ -178,11 +215,13 @@ pub struct RawArgs {
     arg_path: Vec<String>,
     flag_after_context: usize,
     flag_before_context: usize,
+    flag_case_sensitive: bool,
     flag_color: String,
     flag_column: bool,
     flag_context: usize,
     flag_context_separator: String,
     flag_count: bool,
+    flag_files_with_matches: bool,
     flag_debug: bool,
     flag_files: bool,
     flag_follow: bool,
@@ -193,16 +232,21 @@ pub struct RawArgs {
     flag_invert_match: bool,
     flag_line_number: bool,
     flag_fixed_strings: bool,
+    flag_maxdepth: Option<usize>,
     flag_mmap: bool,
     flag_no_heading: bool,
     flag_no_ignore: bool,
     flag_no_ignore_parent: bool,
+    flag_no_ignore_vcs: bool,
     flag_no_line_number: bool,
     flag_no_mmap: bool,
+    flag_no_filename: bool,
+    flag_null: bool,
     flag_pretty: bool,
     flag_quiet: bool,
     flag_regexp: Vec<String>,
     flag_replace: Option<String>,
+    flag_smart_case: bool,
     flag_text: bool,
     flag_threads: usize,
     flag_type: Vec<String>,
@@ -219,7 +263,6 @@ pub struct RawArgs {
 /// Args are transformed/normalized from RawArgs.
 #[derive(Debug)]
 pub struct Args {
-    pattern: String,
     paths: Vec<PathBuf>,
     after_context: usize,
     before_context: usize,
@@ -227,6 +270,7 @@ pub struct Args {
     column: bool,
     context_separator: Vec<u8>,
     count: bool,
+    files_with_matches: bool,
     eol: u8,
     files: bool,
     follow: bool,
@@ -238,14 +282,16 @@ pub struct Args {
     invert_match: bool,
     line_number: bool,
     line_per_match: bool,
+    maxdepth: Option<usize>,
     mmap: bool,
     no_ignore: bool,
     no_ignore_parent: bool,
+    no_ignore_vcs: bool,
+    null: bool,
     quiet: bool,
     replace: Option<Vec<u8>>,
     text: bool,
     threads: usize,
-    type_defs: Vec<FileTypeDef>,
     type_list: bool,
     types: Types,
     with_filename: bool,
@@ -254,12 +300,12 @@ pub struct Args {
 impl RawArgs {
     /// Convert arguments parsed into a configuration used by ripgrep.
     fn to_args(&self) -> Result<Args> {
-        let pattern = self.pattern();
         let paths =
             if self.arg_path.is_empty() {
                 if atty::on_stdin()
                     || self.flag_files
-                    || self.flag_type_list {
+                    || self.flag_type_list
+                    || !atty::stdin_is_readable() {
                     vec![Path::new("./").to_path_buf()]
                 } else {
                     vec![Path::new("-").to_path_buf()]
@@ -283,6 +329,9 @@ impl RawArgs {
             } else if cfg!(windows) {
                 // On Windows, memory maps appear faster than read calls. Neat.
                 true
+            } else if cfg!(darwin) {
+                // On Mac, memory maps appear to suck. Neat.
+                false
             } else {
                 // If we're only searching a few paths and all of them are
                 // files, then memory maps are probably faster.
@@ -309,33 +358,26 @@ impl RawArgs {
                 self.flag_threads
             };
         let color =
-            if self.flag_vimgrep {
+            if self.flag_color == "always" {
+                true
+            } else if self.flag_vimgrep {
                 false
             } else if self.flag_color == "auto" {
                 atty::on_stdout() || self.flag_pretty
             } else {
-                self.flag_color == "always"
+                false
             };
-        let eol = b'\n';
+
         let mut with_filename = self.flag_with_filename;
         if !with_filename {
             with_filename = paths.len() > 1 || paths[0].is_dir();
         }
-        let mut btypes = TypesBuilder::new();
-        btypes.add_defaults();
-        try!(self.add_types(&mut btypes));
-        let types = try!(btypes.build());
-        let grep = try!(
-            GrepBuilder::new(&pattern)
-                .case_insensitive(self.flag_ignore_case)
-                .line_terminator(eol)
-                .build()
-        );
+        with_filename = with_filename && !self.flag_no_filename;
+
         let no_ignore = self.flag_no_ignore || self.flag_unrestricted >= 1;
         let hidden = self.flag_hidden || self.flag_unrestricted >= 2;
         let text = self.flag_text || self.flag_unrestricted >= 3;
         let mut args = Args {
-            pattern: pattern,
             paths: paths,
             after_context: after_context,
             before_context: before_context,
@@ -343,29 +385,34 @@ impl RawArgs {
             column: self.flag_column,
             context_separator: unescape(&self.flag_context_separator),
             count: self.flag_count,
-            eol: eol,
+            files_with_matches: self.flag_files_with_matches,
+            eol: self.eol(),
             files: self.flag_files,
             follow: self.flag_follow,
             glob_overrides: glob_overrides,
-            grep: grep,
+            grep: try!(self.grep()),
             heading: !self.flag_no_heading && self.flag_heading,
             hidden: hidden,
             ignore_case: self.flag_ignore_case,
             invert_match: self.flag_invert_match,
             line_number: !self.flag_no_line_number && self.flag_line_number,
             line_per_match: self.flag_vimgrep,
+            maxdepth: self.flag_maxdepth,
             mmap: mmap,
             no_ignore: no_ignore,
             no_ignore_parent:
                 // --no-ignore implies --no-ignore-parent
                 self.flag_no_ignore_parent || no_ignore,
+            no_ignore_vcs:
+                // --no-ignore implies --no-ignore-vcs
+                self.flag_no_ignore_vcs || no_ignore,
+            null: self.flag_null,
             quiet: self.flag_quiet,
             replace: self.flag_replace.clone().map(|s| s.into_bytes()),
             text: text,
             threads: threads,
-            type_defs: btypes.definitions(),
             type_list: self.flag_type_list,
-            types: types,
+            types: try!(self.types()),
             with_filename: with_filename,
         };
         // If stdout is a tty, then apply some special default options.
@@ -384,20 +431,22 @@ impl RawArgs {
         Ok(args)
     }
 
-    fn add_types(&self, types: &mut TypesBuilder) -> Result<()> {
+    fn types(&self) -> Result<Types> {
+        let mut btypes = TypesBuilder::new();
+        btypes.add_defaults();
         for ty in &self.flag_type_clear {
-            types.clear(ty);
+            btypes.clear(ty);
         }
         for def in &self.flag_type_add {
-            try!(types.add_def(def));
+            try!(btypes.add_def(def));
         }
         for ty in &self.flag_type {
-            types.select(ty);
+            btypes.select(ty);
         }
         for ty in &self.flag_type_not {
-            types.negate(ty);
+            btypes.negate(ty);
         }
-        Ok(())
+        btypes.build().map_err(From::from)
     }
 
     fn pattern(&self) -> String {
@@ -427,6 +476,27 @@ impl RawArgs {
             s
         }
     }
+
+    fn eol(&self) -> u8 {
+        // We might want to make this configurable.
+        b'\n'
+    }
+
+    fn grep(&self) -> Result<Grep> {
+        let smart =
+            self.flag_smart_case
+            && !self.flag_ignore_case
+            && !self.flag_case_sensitive;
+        let casei =
+            self.flag_ignore_case
+            && !self.flag_case_sensitive;
+        GrepBuilder::new(&self.pattern())
+            .case_smart(smart)
+            .case_insensitive(casei)
+            .line_terminator(self.eol())
+            .build()
+            .map_err(From::from)
+    }
 }
 
 impl Args {
@@ -451,7 +521,7 @@ impl Args {
                 }
             }
         }
-        let raw: RawArgs =
+        let mut raw: RawArgs =
             Docopt::new(USAGE)
                 .and_then(|d| d.argv(argv).version(Some(version())).decode())
                 .unwrap_or_else(|e| e.exit());
@@ -466,6 +536,13 @@ impl Args {
             errored!("failed to initialize logger: {}", err);
         }
 
+        // *sigh*... If --files is given, then the first path ends up in
+        // pattern.
+        if raw.flag_files {
+            if !raw.arg_pattern.is_empty() {
+                raw.arg_path.insert(0, raw.arg_pattern.clone());
+            }
+        }
         raw.to_args().map_err(From::from)
     }
 
@@ -496,6 +573,11 @@ impl Args {
         self.mmap
     }
 
+    /// Whether ripgrep should be quiet or not.
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
     /// Create a new printer of individual search results that writes to the
     /// writer given.
     pub fn printer<W: Terminal + Send>(&self, wtr: W) -> Printer<W> {
@@ -505,7 +587,7 @@ impl Args {
             .eol(self.eol)
             .heading(self.heading)
             .line_per_match(self.line_per_match)
-            .quiet(self.quiet)
+            .null(self.null)
             .with_filename(self.with_filename);
         if let Some(ref rep) = self.replace {
             p = p.replace(rep.clone());
@@ -517,12 +599,21 @@ impl Args {
     /// to the writer given.
     pub fn out(&self) -> Out {
         let mut out = Out::new(self.color);
-        if self.heading && !self.count {
-            out = out.file_separator(b"".to_vec());
-        } else if self.before_context > 0 || self.after_context > 0 {
-            out = out.file_separator(self.context_separator.clone());
+        if let Some(filesep) = self.file_separator() {
+            out = out.file_separator(filesep);
         }
         out
+    }
+
+    /// Retrieve the configured file separator.
+    pub fn file_separator(&self) -> Option<Vec<u8>> {
+        if self.heading && !self.count && !self.files_with_matches {
+            Some(b"".to_vec())
+        } else if self.before_context > 0 || self.after_context > 0 {
+            Some(self.context_separator.clone())
+        } else {
+            None
+        }
     }
 
     /// Create a new buffer for use with searching.
@@ -571,9 +662,11 @@ impl Args {
             .after_context(self.after_context)
             .before_context(self.before_context)
             .count(self.count)
+            .files_with_matches(self.files_with_matches)
             .eol(self.eol)
             .line_number(self.line_number)
             .invert_match(self.invert_match)
+            .quiet(self.quiet)
             .text(self.text)
     }
 
@@ -589,9 +682,11 @@ impl Args {
     ) -> BufferSearcher<'a, W> {
         BufferSearcher::new(printer, grep, path, buf)
             .count(self.count)
+            .files_with_matches(self.files_with_matches)
             .eol(self.eol)
             .line_number(self.line_number)
             .invert_match(self.invert_match)
+            .quiet(self.quiet)
             .text(self.text)
     }
 
@@ -602,7 +697,7 @@ impl Args {
 
     /// Returns a list of type definitions currently loaded.
     pub fn type_defs(&self) -> &[FileTypeDef] {
-        &self.type_defs
+        self.types.definitions()
     }
 
     /// Returns true if ripgrep should print the type definitions currently
@@ -613,16 +708,25 @@ impl Args {
 
     /// Create a new recursive directory iterator at the path given.
     pub fn walker(&self, path: &Path) -> Result<walk::Iter> {
-        let wd = WalkDir::new(path).follow_links(self.follow);
-        let mut ig = Ignore::new();
-        ig.ignore_hidden(!self.hidden);
-        ig.no_ignore(self.no_ignore);
-        ig.add_types(self.types.clone());
-        if !self.no_ignore_parent {
-            try!(ig.push_parents(path));
+        let mut wd = WalkDir::new(path).follow_links(self.follow);
+        if let Some(maxdepth) = self.maxdepth {
+            wd = wd.max_depth(maxdepth);
         }
-        if let Some(ref overrides) = self.glob_overrides {
-            ig.add_override(overrides.clone());
+        let mut ig = Ignore::new();
+        // Only register ignore rules if this is a directory. If it's a file,
+        // then it was explicitly given by the end user, so we always search
+        // it.
+        if path.is_dir() {
+            ig.ignore_hidden(!self.hidden);
+            ig.no_ignore(self.no_ignore);
+            ig.no_ignore_vcs(self.no_ignore_vcs);
+            ig.add_types(self.types.clone());
+            if !self.no_ignore_parent {
+                try!(ig.push_parents(path));
+            }
+            if let Some(ref overrides) = self.glob_overrides {
+                ig.add_override(overrides.clone());
+            }
         }
         Ok(walk::Iter::new(ig, wd))
     }

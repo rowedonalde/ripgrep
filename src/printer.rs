@@ -4,6 +4,7 @@ use regex::bytes::Regex;
 use term::{Attr, Terminal};
 use term::color;
 
+use pathutil::strip_prefix;
 use types::FileTypeDef;
 
 /// Printer encapsulates all output logic for searching.
@@ -24,18 +25,49 @@ pub struct Printer<W> {
     /// printed via the match directly, but occasionally we need to insert them
     /// ourselves (for example, to print a context separator).
     eol: u8,
+    /// A file separator to show before any matches are printed.
+    file_separator: Option<Vec<u8>>,
     /// Whether to show file name as a heading or not.
     ///
     /// N.B. If with_filename is false, then this setting has no effect.
     heading: bool,
     /// Whether to show every match on its own line.
     line_per_match: bool,
-    /// Whether to suppress all output.
-    quiet: bool,
+    /// Whether to print NUL bytes after a file path instead of new lines
+    /// or `:`.
+    null: bool,
     /// A string to use as a replacement of each match in a matching line.
     replace: Option<Vec<u8>>,
     /// Whether to prefix each match with the corresponding file name.
     with_filename: bool,
+    /// The choice of colors.
+    color_choice: ColorChoice
+}
+
+struct ColorChoice {
+    matched_line: color::Color,
+    heading: color::Color,
+    line_number: color::Color
+}
+
+impl ColorChoice {
+    #[cfg(unix)]
+    pub fn new() -> ColorChoice {
+        ColorChoice {
+            matched_line: color::RED,
+            heading: color::GREEN,
+            line_number: color::BLUE
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn new() -> ColorChoice {
+        ColorChoice {
+            matched_line: color::BRIGHT_RED,
+            heading: color::BRIGHT_GREEN,
+            line_number: color::BRIGHT_BLUE
+        }
+    }
 }
 
 impl<W: Terminal + Send> Printer<W> {
@@ -47,11 +79,13 @@ impl<W: Terminal + Send> Printer<W> {
             column: false,
             context_separator: "--".to_string().into_bytes(),
             eol: b'\n',
+            file_separator: None,
             heading: false,
             line_per_match: false,
-            quiet: false,
+            null: false,
             replace: None,
             with_filename: false,
+            color_choice: ColorChoice::new()
         }
     }
 
@@ -74,6 +108,13 @@ impl<W: Terminal + Send> Printer<W> {
         self
     }
 
+    /// If set, the separator is printed before any matches. By default, no
+    /// separator is printed.
+    pub fn file_separator(mut self, sep: Vec<u8>) -> Printer<W> {
+        self.file_separator = Some(sep);
+        self
+    }
+
     /// Whether to show file name as a heading or not.
     ///
     /// N.B. If with_filename is false, then this setting has no effect.
@@ -88,9 +129,10 @@ impl<W: Terminal + Send> Printer<W> {
         self
     }
 
-    /// When set, all output is suppressed.
-    pub fn quiet(mut self, yes: bool) -> Printer<W> {
-        self.quiet = yes;
+    /// Whether to cause NUL bytes to follow file paths instead of other
+    /// visual separators (like `:`, `-` and `\n`).
+    pub fn null(mut self, yes: bool) -> Printer<W> {
+        self.null = yes;
         self
     }
 
@@ -138,15 +180,24 @@ impl<W: Terminal + Send> Printer<W> {
 
     /// Prints the given path.
     pub fn path<P: AsRef<Path>>(&mut self, path: P) {
-        self.write(path.as_ref().to_string_lossy().as_bytes());
-        self.write_eol();
+        let path = strip_prefix("./", path.as_ref()).unwrap_or(path.as_ref());
+        self.write_path(path);
+        if self.null {
+            self.write(b"\x00");
+        } else {
+            self.write_eol();
+        }
     }
 
     /// Prints the given path and a count of the number of matches found.
     pub fn path_count<P: AsRef<Path>>(&mut self, path: P, count: u64) {
         if self.with_filename {
-            self.write(path.as_ref().to_string_lossy().as_bytes());
-            self.write(b":");
+            self.write_path(path);
+            if self.null {
+                self.write(b"\x00");
+            } else {
+                self.write(b":");
+            }
         }
         self.write(count.to_string().as_bytes());
         self.write_eol();
@@ -155,9 +206,6 @@ impl<W: Terminal + Send> Printer<W> {
     /// Prints the context separator.
     pub fn context_separate(&mut self) {
         // N.B. We can't use `write` here because of borrowing restrictions.
-        if self.quiet {
-            return;
-        }
         if self.context_separator.is_empty() {
             return;
         }
@@ -179,7 +227,7 @@ impl<W: Terminal + Send> Printer<W> {
             let column =
                 if self.column {
                     Some(re.find(&buf[start..end])
-                            .map(|(s, _)| s + 1).unwrap_or(0) as u64)
+                           .map(|(s, _)| s).unwrap_or(0) as u64)
                 } else {
                     None
                 };
@@ -204,10 +252,10 @@ impl<W: Terminal + Send> Printer<W> {
         column: Option<u64>,
     ) {
         if self.heading && self.with_filename && !self.has_printed {
+            self.write_file_sep();
             self.write_heading(path.as_ref());
         } else if !self.heading && self.with_filename {
-            self.write(path.as_ref().to_string_lossy().as_bytes());
-            self.write(b":");
+            self.write_non_heading_path(path.as_ref());
         }
         if let Some(line_number) = line_number {
             self.line_number(line_number, b':');
@@ -236,7 +284,7 @@ impl<W: Terminal + Send> Printer<W> {
         let mut last_written = 0;
         for (s, e) in re.find_iter(buf) {
             self.write(&buf[last_written..s]);
-            let _ = self.wtr.fg(color::BRIGHT_RED);
+            let _ = self.wtr.fg(self.color_choice.matched_line);
             let _ = self.wtr.attr(Attr::Bold);
             self.write(&buf[s..e]);
             let _ = self.wtr.reset();
@@ -254,10 +302,15 @@ impl<W: Terminal + Send> Printer<W> {
         line_number: Option<u64>,
     ) {
         if self.heading && self.with_filename && !self.has_printed {
+            self.write_file_sep();
             self.write_heading(path.as_ref());
         } else if !self.heading && self.with_filename {
-            self.write(path.as_ref().to_string_lossy().as_bytes());
-            self.write(b"-");
+            self.write_path(path.as_ref());
+            if self.null {
+                self.write(b"\x00");
+            } else {
+                self.write(b"-");
+            }
         }
         if let Some(line_number) = line_number {
             self.line_number(line_number, b'-');
@@ -270,19 +323,39 @@ impl<W: Terminal + Send> Printer<W> {
 
     fn write_heading<P: AsRef<Path>>(&mut self, path: P) {
         if self.wtr.supports_color() {
-            let _ = self.wtr.fg(color::BRIGHT_GREEN);
+            let _ = self.wtr.fg(self.color_choice.heading);
             let _ = self.wtr.attr(Attr::Bold);
         }
-        self.write(path.as_ref().to_string_lossy().as_bytes());
-        self.write_eol();
+        self.write_path(path.as_ref());
+        if self.null {
+            self.write(b"\x00");
+        } else {
+            self.write_eol();
+        }
         if self.wtr.supports_color() {
             let _ = self.wtr.reset();
         }
     }
 
+    fn write_non_heading_path<P: AsRef<Path>>(&mut self, path: P) {
+        if self.wtr.supports_color() {
+            let _ = self.wtr.fg(self.color_choice.heading);
+            let _ = self.wtr.attr(Attr::Bold);
+        }
+        self.write_path(path.as_ref());
+        if self.wtr.supports_color() {
+            let _ = self.wtr.reset();
+        }
+        if self.null {
+            self.write(b"\x00");
+        } else {
+            self.write(b":");
+        }
+    }
+
     fn line_number(&mut self, n: u64, sep: u8) {
         if self.wtr.supports_color() {
-            let _ = self.wtr.fg(color::BRIGHT_BLUE);
+            let _ = self.wtr.fg(self.color_choice.line_number);
             let _ = self.wtr.attr(Attr::Bold);
         }
         self.write(n.to_string().as_bytes());
@@ -292,10 +365,20 @@ impl<W: Terminal + Send> Printer<W> {
         self.write(&[sep]);
     }
 
+    #[cfg(unix)]
+    fn write_path<P: AsRef<Path>>(&mut self, path: P) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = path.as_ref().as_os_str().as_bytes();
+        self.write(path);
+    }
+
+    #[cfg(not(unix))]
+    fn write_path<P: AsRef<Path>>(&mut self, path: P) {
+        self.write(path.as_ref().to_string_lossy().as_bytes());
+    }
+
     fn write(&mut self, buf: &[u8]) {
-        if self.quiet {
-            return;
-        }
         self.has_printed = true;
         let _ = self.wtr.write_all(buf);
     }
@@ -303,5 +386,13 @@ impl<W: Terminal + Send> Printer<W> {
     fn write_eol(&mut self) {
         let eol = self.eol;
         self.write(&[eol]);
+    }
+
+    fn write_file_sep(&mut self) {
+        if let Some(ref sep) = self.file_separator {
+            self.has_printed = true;
+            let _ = self.wtr.write_all(sep);
+            let _ = self.wtr.write_all(b"\n");
+        }
     }
 }

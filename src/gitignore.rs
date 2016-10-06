@@ -28,15 +28,15 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
+use globset::{self, PatternBuilder, Set, SetBuilder};
 use regex;
 
-use glob;
-use pathutil::strip_prefix;
+use pathutil::{is_file_name, strip_prefix};
 
 /// Represents an error that can occur when parsing a gitignore file.
 #[derive(Debug)]
 pub enum Error {
-    Glob(glob::Error),
+    Glob(globset::Error),
     Regex(regex::Error),
     Io(io::Error),
 }
@@ -61,8 +61,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl From<glob::Error> for Error {
-    fn from(err: glob::Error) -> Error {
+impl From<globset::Error> for Error {
+    fn from(err: globset::Error) -> Error {
         Error::Glob(err)
     }
 }
@@ -82,7 +82,7 @@ impl From<io::Error> for Error {
 /// Gitignore is a matcher for the glob patterns in a single gitignore file.
 #[derive(Clone, Debug)]
 pub struct Gitignore {
-    set: glob::Set,
+    set: Set,
     root: PathBuf,
     patterns: Vec<Pattern>,
     num_ignores: u64,
@@ -115,7 +115,17 @@ impl Gitignore {
         if let Some(p) = strip_prefix("./", path) {
             path = p;
         }
-        if let Some(p) = strip_prefix(&self.root, path) {
+        // Strip any common prefix between the candidate path and the root
+        // of the gitignore, to make sure we get relative matching right.
+        // BUT, a file name might not have any directory components to it,
+        // in which case, we don't want to accidentally strip any part of the
+        // file name.
+        if !is_file_name(path) {
+            if let Some(p) = strip_prefix(&self.root, path) {
+                path = p;
+            }
+        }
+        if let Some(p) = strip_prefix("/", path) {
             path = p;
         }
         self.matched_stripped(path, is_dir)
@@ -197,7 +207,7 @@ impl<'a> Match<'a> {
 /// GitignoreBuilder constructs a matcher for a single set of globs from a
 /// .gitignore file.
 pub struct GitignoreBuilder {
-    builder: glob::SetBuilder,
+    builder: SetBuilder,
     root: PathBuf,
     patterns: Vec<Pattern>,
 }
@@ -225,9 +235,10 @@ impl GitignoreBuilder {
     /// The path given should be the path at which the globs for this gitignore
     /// file should be matched.
     pub fn new<P: AsRef<Path>>(root: P) -> GitignoreBuilder {
+        let root = strip_prefix("./", root.as_ref()).unwrap_or(root.as_ref());
         GitignoreBuilder {
-            builder: glob::SetBuilder::new(),
-            root: root.as_ref().to_path_buf(),
+            builder: SetBuilder::new(),
+            root: root.to_path_buf(),
             patterns: vec![],
         }
     }
@@ -250,6 +261,7 @@ impl GitignoreBuilder {
     /// Add each pattern line from the file path given.
     pub fn add_path<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
         let rdr = io::BufReader::new(try!(File::open(&path)));
+        debug!("gitignore: {}", path.as_ref().display());
         for line in rdr.lines() {
             try!(self.add(&path, &try!(line)));
         }
@@ -272,6 +284,12 @@ impl GitignoreBuilder {
         from: P,
         mut line: &str,
     ) -> Result<(), Error> {
+        if line.starts_with("#") {
+            return Ok(());
+        }
+        if !line.ends_with("\\ ") {
+            line = line.trim_right();
+        }
         if line.is_empty() {
             return Ok(());
         }
@@ -282,34 +300,24 @@ impl GitignoreBuilder {
             whitelist: false,
             only_dir: false,
         };
-        let mut opts = glob::MatchOptions::default();
+        let mut literal_separator = false;
         let has_slash = line.chars().any(|c| c == '/');
-        // If the line starts with an escaped '!', then remove the escape.
-        // Otherwise, if it starts with an unescaped '!', then this is a
-        // whitelist pattern.
-        match line.chars().nth(0) {
-            Some('#') => return Ok(()),
-            Some('\\') => {
-                match line.chars().nth(1) {
-                    Some('!') | Some('#') => {
-                        line = &line[1..];
-                    }
-                    _ => {}
-                }
-            }
-            Some('!') => {
+        let is_absolute = line.chars().nth(0).unwrap() == '/';
+        if line.starts_with("\\!") || line.starts_with("\\#") {
+            line = &line[1..];
+        } else {
+            if line.starts_with("!") {
                 pat.whitelist = true;
                 line = &line[1..];
             }
-            Some('/') => {
+            if line.starts_with("/") {
                 // `man gitignore` says that if a glob starts with a slash,
                 // then the glob can only match the beginning of a path
                 // (relative to the location of gitignore). We achieve this by
                 // simply banning wildcards from matching /.
-                opts.require_literal_separator = true;
+                literal_separator = true;
                 line = &line[1..];
             }
-            _ => {}
         }
         // If it ends with a slash, then this should only match directories,
         // but the slash should otherwise not be used while globbing.
@@ -320,16 +328,31 @@ impl GitignoreBuilder {
             }
         }
         // If there is a literal slash, then we note that so that globbing
-        // doesn't let wildcards match slashes. Otherwise, we need to let
-        // the pattern match anywhere, so we add a `**/` prefix to achieve
-        // that behavior.
+        // doesn't let wildcards match slashes.
         pat.pat = line.to_string();
         if has_slash {
-            opts.require_literal_separator = true;
-        } else {
-            pat.pat = format!("**/{}", pat.pat);
+            literal_separator = true;
         }
-        try!(self.builder.add_with(&pat.pat, &opts));
+        // If there was a leading slash, then this is a pattern that must
+        // match the entire path name. Otherwise, we should let it match
+        // anywhere, so use a **/ prefix.
+        if !is_absolute {
+            // ... but only if we don't already have a **/ prefix.
+            if !pat.pat.starts_with("**/") {
+                pat.pat = format!("**/{}", pat.pat);
+            }
+        }
+        // If the pattern ends with `/**`, then we should only match everything
+        // inside a directory, but not the directory itself. Standard globs
+        // will match the directory. So we add `/*` to force the issue.
+        if pat.pat.ends_with("/**") {
+            pat.pat = format!("{}/*", pat.pat);
+        }
+        let parsed = try!(
+            PatternBuilder::new(&pat.pat)
+                .literal_separator(literal_separator)
+                .build());
+        self.builder.add(parsed);
         self.patterns.push(pat);
         Ok(())
     }
@@ -393,10 +416,14 @@ mod tests {
     ignored!(ig24, ROOT, "target", "grep/target");
     ignored!(ig25, ROOT, "Cargo.lock", "./tabwriter-bin/Cargo.lock");
     ignored!(ig26, ROOT, "/foo/bar/baz", "./foo/bar/baz");
+    ignored!(ig27, ROOT, "foo/", "xyz/foo", true);
+    ignored!(ig28, ROOT, "src/*.rs", "src/grep/src/main.rs");
+    ignored!(ig29, "./src", "/llvm/", "./src/llvm", true);
+    ignored!(ig30, ROOT, "node_modules/ ", "node_modules", true);
 
     not_ignored!(ignot1, ROOT, "amonths", "months");
     not_ignored!(ignot2, ROOT, "monthsa", "months");
-    not_ignored!(ignot3, ROOT, "src/*.rs", "src/grep/src/main.rs");
+    not_ignored!(ignot3, ROOT, "/src/*.rs", "src/grep/src/main.rs");
     not_ignored!(ignot4, ROOT, "/*.c", "mozilla-sha1/sha1.c");
     not_ignored!(ignot5, ROOT, "/src/*.rs", "src/grep/src/main.rs");
     not_ignored!(ignot6, ROOT, "*.rs\n!src/main.rs", "src/main.rs");
@@ -406,4 +433,14 @@ mod tests {
     not_ignored!(ignot10, ROOT, "**/foo/bar", "foo/src/bar");
     not_ignored!(ignot11, ROOT, "#foo", "#foo");
     not_ignored!(ignot12, ROOT, "\n\n\n", "foo");
+    not_ignored!(ignot13, ROOT, "foo/**", "foo", true);
+    not_ignored!(
+        ignot14, "./third_party/protobuf", "m4/ltoptions.m4",
+        "./third_party/protobuf/csharp/src/packages/repositories.config");
+
+    // See: https://github.com/BurntSushi/ripgrep/issues/106
+    #[test]
+    fn regression_106() {
+        Gitignore::from_str("/", " ").unwrap();
+    }
 }

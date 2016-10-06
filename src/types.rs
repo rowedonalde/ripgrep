@@ -11,15 +11,15 @@ use std::path::Path;
 use regex;
 
 use gitignore::{Match, Pattern};
-use glob::{self, MatchOptions};
+use globset::{self, PatternBuilder, Set, SetBuilder};
 
 const TYPE_EXTENSIONS: &'static [(&'static str, &'static [&'static str])] = &[
     ("asm", &["*.asm", "*.s", "*.S"]),
     ("awk", &["*.awk"]),
     ("c", &["*.c", "*.h", "*.H"]),
     ("cbor", &["*.cbor"]),
-    ("clojure", &["*.clj", "*.cljs"]),
-    ("cmake", &["CMakeLists.txt"]),
+    ("clojure", &["*.clj", "*.cljc", "*.cljs", "*.cljx"]),
+    ("cmake", &["*.cmake", "CMakeLists.txt"]),
     ("coffeescript", &["*.coffee"]),
     ("cpp", &[
         "*.C", "*.cc", "*.cpp", "*.cxx",
@@ -36,12 +36,16 @@ const TYPE_EXTENSIONS: &'static [(&'static str, &'static [&'static str])] = &[
         "*.f", "*.F", "*.f77", "*.F77", "*.pfo",
         "*.f90", "*.F90", "*.f95", "*.F95",
     ]),
+    ("fsharp", &["*.fs", "*.fsx", "*.fsi"]),
     ("go", &["*.go"]),
     ("groovy", &["*.groovy"]),
     ("haskell", &["*.hs", "*.lhs"]),
     ("html", &["*.htm", "*.html"]),
     ("java", &["*.java"]),
-    ("js", &["*.js"]),
+    ("jinja", &["*.jinja", "*.jinja2"]),
+    ("js", &[
+        "*.js", "*.jsx", "*.vue",
+    ]),
     ("json", &["*.json"]),
     ("jsonl", &["*.jsonl"]),
     ("lisp", &["*.el", "*.jl", "*.lisp", "*.lsp", "*.sc", "*.scm"]),
@@ -52,6 +56,7 @@ const TYPE_EXTENSIONS: &'static [(&'static str, &'static [&'static str])] = &[
     ("matlab", &["*.m"]),
     ("mk", &["mkfile"]),
     ("ml", &["*.ml"]),
+    ("nim", &["*.nim"]),
     ("objc", &["*.h", "*.m"]),
     ("objcpp", &["*.h", "*.mm"]),
     ("ocaml", &["*.ml", "*.mli", "*.mll", "*.mly"]),
@@ -66,7 +71,10 @@ const TYPE_EXTENSIONS: &'static [(&'static str, &'static [&'static str])] = &[
     ("scala", &["*.scala"]),
     ("sh", &["*.bash", "*.csh", "*.ksh", "*.sh", "*.tcsh"]),
     ("sql", &["*.sql"]),
+    ("sv", &["*.v", "*.vg", "*.sv", "*.svh", "*.h"]),
+    ("swift", &["*.swift"]),
     ("tex", &["*.tex", "*.cls", "*.sty"]),
+    ("ts", &["*.ts", "*.tsx"]),
     ("txt", &["*.txt"]),
     ("toml", &["*.toml", "Cargo.lock"]),
     ("vala", &["*.vala"]),
@@ -86,7 +94,7 @@ pub enum Error {
     /// A user specified file type definition could not be parsed.
     InvalidDefinition,
     /// There was an error building the matcher (probably a bad glob).
-    Glob(glob::Error),
+    Glob(globset::Error),
     /// There was an error compiling a glob as a regex.
     Regex(regex::Error),
 }
@@ -118,8 +126,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl From<glob::Error> for Error {
-    fn from(err: glob::Error) -> Error {
+impl From<globset::Error> for Error {
+    fn from(err: globset::Error) -> Error {
         Error::Glob(err)
     }
 }
@@ -152,8 +160,9 @@ impl FileTypeDef {
 /// Types is a file type matcher.
 #[derive(Clone, Debug)]
 pub struct Types {
-    selected: Option<glob::SetYesNo>,
-    negated: Option<glob::SetYesNo>,
+    defs: Vec<FileTypeDef>,
+    selected: Option<Set>,
+    negated: Option<Set>,
     has_selected: bool,
     unmatched_pat: Pattern,
 }
@@ -166,11 +175,13 @@ impl Types {
     /// If has_selected is true, then at least one file type was selected.
     /// Therefore, any non-matches should be ignored.
     fn new(
-        selected: Option<glob::SetYesNo>,
-        negated: Option<glob::SetYesNo>,
+        selected: Option<Set>,
+        negated: Option<Set>,
         has_selected: bool,
+        defs: Vec<FileTypeDef>,
     ) -> Types {
         Types {
+            defs: defs,
             selected: selected,
             negated: negated,
             has_selected: has_selected,
@@ -186,7 +197,7 @@ impl Types {
 
     /// Creates a new file type matcher that never matches.
     pub fn empty() -> Types {
-        Types::new(None, None, false)
+        Types::new(None, None, false, vec![])
     }
 
     /// Returns a match for the given path against this file type matcher.
@@ -226,6 +237,11 @@ impl Types {
             Match::None
         }
     }
+
+    /// Return the set of current file type definitions.
+    pub fn definitions(&self) -> &[FileTypeDef] {
+        &self.defs
+    }
 }
 
 /// TypesBuilder builds a type matcher from a set of file type definitions and
@@ -249,14 +265,11 @@ impl TypesBuilder {
     /// Build the current set of file type definitions *and* selections into
     /// a file type matcher.
     pub fn build(&self) -> Result<Types, Error> {
-        let opts = MatchOptions {
-            require_literal_separator: true, ..MatchOptions::default()
-        };
         let selected_globs =
             if self.selected.is_empty() {
                 None
             } else {
-                let mut bset = glob::SetBuilder::new();
+                let mut bset = SetBuilder::new();
                 for name in &self.selected {
                     let globs = match self.types.get(name) {
                         Some(globs) => globs,
@@ -266,16 +279,19 @@ impl TypesBuilder {
                         }
                     };
                     for glob in globs {
-                        try!(bset.add_with(glob, &opts));
+                        let pat = try!(
+                            PatternBuilder::new(glob)
+                                .literal_separator(true).build());
+                        bset.add(pat);
                     }
                 }
-                Some(try!(bset.build_yesno()))
+                Some(try!(bset.build()))
             };
         let negated_globs =
             if self.negated.is_empty() {
                 None
             } else {
-                let mut bset = glob::SetBuilder::new();
+                let mut bset = SetBuilder::new();
                 for name in &self.negated {
                     let globs = match self.types.get(name) {
                         Some(globs) => globs,
@@ -285,13 +301,20 @@ impl TypesBuilder {
                         }
                     };
                     for glob in globs {
-                        try!(bset.add_with(glob, &opts));
+                        let pat = try!(
+                            PatternBuilder::new(glob)
+                                .literal_separator(true).build());
+                        bset.add(pat);
                     }
                 }
-                Some(try!(bset.build_yesno()))
+                Some(try!(bset.build()))
             };
         Ok(Types::new(
-            selected_globs, negated_globs, !self.selected.is_empty()))
+            selected_globs,
+            negated_globs,
+            !self.selected.is_empty(),
+            self.definitions(),
+        ))
     }
 
     /// Return the set of current file type definitions.

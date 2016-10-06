@@ -12,9 +12,9 @@ rg [*options*] --files [*<*path*> ...*]
 
 rg [*options*] --type-list
 
-rg --help
+rg [*options*] --help
 
-rg --version
+rg [*options*] --version
 
 # DESCRIPTION
 
@@ -49,7 +49,7 @@ the raw speed of grep.
 : Show this usage message.
 
 -i, --ignore-case
-: Case insensitive search.
+: Case insensitive search. Overridden by --case-sensitive.
 
 -n, --line-number
 : Show line numbers (1-based). This is enabled by default at a tty.
@@ -58,7 +58,8 @@ the raw speed of grep.
 : Suppress line numbers.
 
 -q, --quiet
-: Do not print anything to stdout.
+: Do not print anything to stdout. If a match is found in a file, stop
+  searching that file.
 
 -r, --replace *ARG*
 : Replace every match with the string given. Capture group indices (e.g., $5)
@@ -110,9 +111,16 @@ the raw speed of grep.
 --files
 : Print each file that would be searched (but don't search).
 
+-l, --files-with-matches
+: Only show path of each file with matches.
+
 -H, --with-filename
 : Prefix each match with the file name that contains it. This is the
   default when more than one file is searched.
+
+--no-filename
+: Never show the filename for a match. This is the default when
+  one file is searched.
 
 --heading
 : Show the file name above clusters of matches from each file.
@@ -127,6 +135,10 @@ the raw speed of grep.
 
 -L, --follow
 : Follow symlinks.
+
+--maxdepth *NUM*
+: Descend at most NUM directories below the command line arguments.
+  A value of zero searches only the starting-points themselves.
 
 --mmap
 : Search using memory maps when possible. This is enabled by default
@@ -143,8 +155,26 @@ the raw speed of grep.
 --no-ignore-parent
 : Don't respect ignore files in parent directories.
 
+--no-ignore-vcs
+: Don't respect version control ignore files (e.g., .gitignore).
+  Note that .ignore files will continue to be respected.
+
+--null
+: Whenever a file name is printed, follow it with a NUL byte.
+  This includes printing filenames before matches, and when printing
+  a list of matching files such as with --count, --files-with-matches
+  and --files.
+
 -p, --pretty
 : Alias for --color=always --heading -n.
+
+-s, --case-sensitive
+: Search case sensitively. This overrides --ignore-case and --smart-case.
+
+-S, --smart-case
+: Search case insensitively if the pattern is all lowercase.
+  Search case sensitively otherwise. This is overridden by either
+  --case-sensitive or --ignore-case.
 
 -j, --threads *ARG*
 : The number of threads to use. Defaults to the number of logical CPUs
@@ -164,8 +194,14 @@ the raw speed of grep.
 : Show all supported file types and their associated globs.
 
 --type-add *ARG* ...
-: Add a new glob for a particular file type.
-  Example: --type-add html:*.html,*.htm
+: Add a new glob for a particular file type. Only one glob can be added
+  at a time. Multiple --type-add flags can be provided. Unless --type-clear
+  is used, globs are added to any existing globs inside of ripgrep. Note that
+  this must be passed to every invocation of rg.
+
+  Example: `--type-add html:*.html`
 
 --type-clear *TYPE* ...
-: Clear the file type globs for TYPE.
+: Clear the file type globs previously defined for TYPE. This only clears
+  the default type definitions that are found inside of ripgrep. Note
+  that this must be passed to every invocation of rg.

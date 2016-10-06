@@ -16,9 +16,9 @@ rg [\f[I]options\f[]] \-\-files [\f[I]<\f[]path\f[I]> ...\f[]]
 .PP
 rg [\f[I]options\f[]] \-\-type\-list
 .PP
-rg \-\-help
+rg [\f[I]options\f[]] \-\-help
 .PP
-rg \-\-version
+rg [\f[I]options\f[]] \-\-version
 .SH DESCRIPTION
 .PP
 rg (ripgrep) combines the usability of The Silver Searcher (an ack
@@ -70,6 +70,7 @@ Show this usage message.
 .TP
 .B \-i, \-\-ignore\-case
 Case insensitive search.
+Overridden by \-\-case\-sensitive.
 .RS
 .RE
 .TP
@@ -86,6 +87,7 @@ Suppress line numbers.
 .TP
 .B \-q, \-\-quiet
 Do not print anything to stdout.
+If a match is found in a file, stop searching that file.
 .RS
 .RE
 .TP
@@ -169,9 +171,20 @@ Print each file that would be searched (but don\[aq]t search).
 .RS
 .RE
 .TP
+.B \-l, \-\-files\-with\-matches
+Only show path of each file with matches.
+.RS
+.RE
+.TP
 .B \-H, \-\-with\-filename
 Prefix each match with the file name that contains it.
 This is the default when more than one file is searched.
+.RS
+.RE
+.TP
+.B \-\-no\-filename
+Never show the filename for a match.
+This is the default when one file is searched.
 .RS
 .RE
 .TP
@@ -194,6 +207,12 @@ Search hidden directories and files.
 .TP
 .B \-L, \-\-follow
 Follow symlinks.
+.RS
+.RE
+.TP
+.B \-\-maxdepth \f[I]NUM\f[]
+Descend at most NUM directories below the command line arguments.
+A value of zero searches only the starting\-points themselves.
 .RS
 .RE
 .TP
@@ -221,8 +240,35 @@ Don\[aq]t respect ignore files in parent directories.
 .RS
 .RE
 .TP
+.B \-\-no\-ignore\-vcs
+Don\[aq]t respect version control ignore files (e.g., .gitignore).
+Note that .ignore files will continue to be respected.
+.RS
+.RE
+.TP
+.B \-\-null
+Whenever a file name is printed, follow it with a NUL byte.
+This includes printing filenames before matches, and when printing a
+list of matching files such as with \-\-count, \-\-files\-with\-matches
+and \-\-files.
+.RS
+.RE
+.TP
 .B \-p, \-\-pretty
 Alias for \-\-color=always \-\-heading \-n.
+.RS
+.RE
+.TP
+.B \-s, \-\-case\-sensitive
+Search case sensitively.
+This overrides \-\-ignore\-case and \-\-smart\-case.
+.RS
+.RE
+.TP
+.B \-S, \-\-smart\-case
+Search case insensitively if the pattern is all lowercase.
+Search case sensitively otherwise.
+This is overridden by either \-\-case\-sensitive or \-\-ignore\-case.
 .RS
 .RE
 .TP
@@ -254,11 +300,20 @@ Show all supported file types and their associated globs.
 .TP
 .B \-\-type\-add \f[I]ARG\f[] ...
 Add a new glob for a particular file type.
-Example: \-\-type\-add html:\f[I]\&.html,\f[].htm
+Only one glob can be added at a time.
+Multiple \-\-type\-add flags can be provided.
+Unless \-\-type\-clear is used, globs are added to any existing globs
+inside of ripgrep.
+Note that this must be passed to every invocation of rg.
 .RS
 .RE
+.PP
+Example: \f[C]\-\-type\-add\ html:*.html\f[]
 .TP
 .B \-\-type\-clear \f[I]TYPE\f[] ...
-Clear the file type globs for TYPE.
+Clear the file type globs previously defined for TYPE.
+This only clears the default type definitions that are found inside of
+ripgrep.
+Note that this must be passed to every invocation of rg.
 .RS
 .RE

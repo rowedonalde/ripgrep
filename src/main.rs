@@ -1,7 +1,7 @@
 extern crate deque;
 extern crate docopt;
 extern crate env_logger;
-extern crate fnv;
+extern crate globset;
 extern crate grep;
 #[cfg(windows)]
 extern crate kernel32;
@@ -23,11 +23,13 @@ extern crate winapi;
 use std::error::Error;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process;
 use std::result;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::cmp;
 
 use deque::{Stealer, Stolen};
 use grep::Grep;
@@ -59,7 +61,6 @@ macro_rules! eprintln {
 mod args;
 mod atty;
 mod gitignore;
-mod glob;
 mod ignore;
 mod out;
 mod pathutil;
@@ -87,24 +88,29 @@ fn main() {
 fn run(args: Args) -> Result<u64> {
     let args = Arc::new(args);
     let paths = args.paths();
+    let threads = cmp::max(1, args.threads() - 1);
+    let isone =
+        paths.len() == 1 && (paths[0] == Path::new("-") || paths[0].is_file());
     if args.files() {
         return run_files(args.clone());
     }
     if args.type_list() {
         return run_types(args.clone());
     }
-    if paths.len() == 1 && (paths[0] == Path::new("-") || paths[0].is_file()) {
-        return run_one(args.clone(), &paths[0]);
+    if threads == 1 || isone {
+        return run_one_thread(args.clone());
     }
 
     let out = Arc::new(Mutex::new(args.out()));
+    let quiet_matched = QuietMatched::new(args.quiet());
     let mut workers = vec![];
 
     let workq = {
         let (workq, stealer) = deque::new();
-        for _ in 0..args.threads() {
+        for _ in 0..threads {
             let worker = MultiWorker {
                 chan_work: stealer.clone(),
+                quiet_matched: quiet_matched.clone(),
                 out: out.clone(),
                 outbuf: Some(args.outbuf()),
                 worker: Worker {
@@ -120,11 +126,17 @@ fn run(args: Args) -> Result<u64> {
     };
     let mut paths_searched: u64 = 0;
     for p in paths {
+        if quiet_matched.has_match() {
+            break;
+        }
         if p == Path::new("-") {
             paths_searched += 1;
             workq.push(Work::Stdin);
         } else {
             for ent in try!(args.walker(p)) {
+                if quiet_matched.has_match() {
+                    break;
+                }
                 paths_searched += 1;
                 workq.push(Work::File(ent));
             }
@@ -145,22 +157,58 @@ fn run(args: Args) -> Result<u64> {
     Ok(match_count)
 }
 
-fn run_one(args: Arc<Args>, path: &Path) -> Result<u64> {
+fn run_one_thread(args: Arc<Args>) -> Result<u64> {
     let mut worker = Worker {
         args: args.clone(),
         inpbuf: args.input_buffer(),
         grep: args.grep(),
         match_count: 0,
     };
-    let term = args.stdout();
-    let mut printer = args.printer(term);
-    let work =
-        if path == Path::new("-") {
-            WorkReady::Stdin
+    let paths = args.paths();
+    let mut term = args.stdout();
+
+    let mut paths_searched: u64 = 0;
+    for p in paths {
+        if args.quiet() && worker.match_count > 0 {
+            break;
+        }
+        if p == Path::new("-") {
+            paths_searched += 1;
+            let mut printer = args.printer(&mut term);
+            if worker.match_count > 0 {
+                if let Some(sep) = args.file_separator() {
+                    printer = printer.file_separator(sep);
+                }
+            }
+            worker.do_work(&mut printer, WorkReady::Stdin);
         } else {
-            WorkReady::PathFile(path.to_path_buf(), try!(File::open(path)))
-        };
-    worker.do_work(&mut printer, work);
+            for ent in try!(args.walker(p)) {
+                paths_searched += 1;
+                let mut printer = args.printer(&mut term);
+                if worker.match_count > 0 {
+                    if args.quiet() {
+                        break;
+                    }
+                    if let Some(sep) = args.file_separator() {
+                        printer = printer.file_separator(sep);
+                    }
+                }
+                let file = match File::open(ent.path()) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        eprintln!("{}: {}", ent.path().display(), err);
+                        continue;
+                    }
+                };
+                worker.do_work(&mut printer, WorkReady::DirFile(ent, file));
+            }
+        }
+    }
+    if !paths.is_empty() && paths_searched == 0 {
+        eprintln!("No files were searched, which means ripgrep probably \
+                   applied a filter you didn't expect. \
+                   Try running again with --debug.");
+    }
     Ok(worker.match_count)
 }
 
@@ -202,11 +250,11 @@ enum Work {
 enum WorkReady {
     Stdin,
     DirFile(DirEntry, File),
-    PathFile(PathBuf, File),
 }
 
 struct MultiWorker {
     chan_work: Stealer<Work>,
+    quiet_matched: QuietMatched,
     out: Arc<Mutex<Out>>,
     #[cfg(not(windows))]
     outbuf: Option<ColoredTerminal<term::TerminfoTerminal<Vec<u8>>>>,
@@ -225,6 +273,9 @@ struct Worker {
 impl MultiWorker {
     fn run(mut self) -> u64 {
         loop {
+            if self.quiet_matched.has_match() {
+                break;
+            }
             let work = match self.chan_work.steal() {
                 Stolen::Empty | Stolen::Abort => continue,
                 Stolen::Data(Work::Quit) => break,
@@ -243,6 +294,9 @@ impl MultiWorker {
             outbuf.clear();
             let mut printer = self.worker.args.printer(outbuf);
             self.worker.do_work(&mut printer, work);
+            if self.quiet_matched.set_match(self.worker.match_count > 0) {
+                break;
+            }
             let outbuf = printer.into_inner();
             if !outbuf.get_ref().is_empty() {
                 let mut out = self.out.lock().unwrap();
@@ -268,17 +322,6 @@ impl Worker {
             }
             WorkReady::DirFile(ent, file) => {
                 let mut path = ent.path();
-                if let Some(p) = strip_prefix("./", path) {
-                    path = p;
-                }
-                if self.args.mmap() {
-                    self.search_mmap(printer, path, &file)
-                } else {
-                    self.search(printer, path, file)
-                }
-            }
-            WorkReady::PathFile(path, file) => {
-                let mut path = &*path;
                 if let Some(p) = strip_prefix("./", path) {
                     path = p;
                 }
@@ -322,7 +365,11 @@ impl Worker {
     ) -> Result<u64> {
         if try!(file.metadata()).len() == 0 {
             // Opening a memory map with an empty file results in an error.
-            return Ok(0);
+            // However, this may not actually be an empty file! For example,
+            // /proc/cpuinfo reports itself as an empty file, but it can
+            // produce data when it's read from. Therefore, we fall back to
+            // regular read calls.
+            return self.search(printer, path, file);
         }
         let mmap = try!(Mmap::open(file, Protection::Read));
         Ok(self.args.searcher_buffer(
@@ -331,5 +378,30 @@ impl Worker {
             path,
             unsafe { mmap.as_slice() },
         ).run())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QuietMatched(Arc<Option<AtomicBool>>);
+
+impl QuietMatched {
+    fn new(quiet: bool) -> QuietMatched {
+        let atomic = if quiet { Some(AtomicBool::new(false)) } else { None };
+        QuietMatched(Arc::new(atomic))
+    }
+
+    fn has_match(&self) -> bool {
+        match *self.0 {
+            None => false,
+            Some(ref matched) => matched.load(Ordering::SeqCst),
+        }
+    }
+
+    fn set_match(&self, yes: bool) -> bool {
+        match *self.0 {
+            None => false,
+            Some(_) if !yes => false,
+            Some(ref m) => { m.store(true, Ordering::SeqCst); true }
+        }
     }
 }
